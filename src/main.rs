@@ -11,7 +11,7 @@ use quilr_remote_connector::tunnel::{TunnelConfig, run_connector_forever};
 #[command(
     name = "quilr-connector",
     version,
-    about = "Quilr Remote Connector — connects private cluster/local MCP servers to Quilr MCP Gateway over WebSocket"
+    about = "Quilr Remote Connector — connects private cluster/local MCP servers and REST APIs (URL-to-MCP) to Quilr MCP Gateway over WebSocket"
 )]
 struct Cli {
     /// Connector authentication token generated in the Quilr Admin Console (qrc_<encoded_gateway_url>.<secret>)
