@@ -1,13 +1,13 @@
 # Quilr Remote Connector (`quilr-connector`)
 
-Lightweight Rust WebSocket reverse-tunnel binary that connects private MCP servers running inside a Kubernetes cluster, VM, or developer laptop to the **Quilr MCP Gateway**.
+Lightweight Rust WebSocket reverse-tunnel binary that connects private MCP servers and internal REST APIs (URL-to-MCP) running inside a Kubernetes cluster, VM, or developer laptop to the **Quilr MCP Gateway**.
 
 ## Features
 
 - **Self-Contained Token**: Tokens (`qrc_<encoded_gateway_url>.<secret>`) generated in the Quilr Admin Console encode the MCP Gateway URL directly — no separate URL configuration is required.
 - **Outbound-Only WebSocket Tunnel**: No inbound firewall ports or public ingress required. Connects out to `wss://<gateway>/api/remote-connectors/ws`.
 - **Zero-Bloat Binary Framing**: Transfers request bodies and response chunks using WebSocket Binary frames (`<single-line JSON header>\n<raw bytes>`) with zero Base64 size expansion.
-- **Multiplexed HTTP & SSE Streaming**: Handles concurrent MCP Streamable HTTP (`POST`/`GET`/`DELETE`) and legacy `SSE` streams over a single WebSocket connection.
+- **Multiplexed HTTP, REST API & SSE Streaming**: Handles concurrent MCP Streamable HTTP (`POST`/`GET`/`DELETE`), legacy `SSE` streams, and REST API (`GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`HEAD`) + OpenAPI specification requests for URL-to-MCP backends over a single WebSocket connection.
 - **High Availability (Multi-Replica)**: Run 2+ connector pods with the same token for load balancing and failover of subsequent requests. In-flight streams fail on disconnect and are never replayed.
 - **Automatic Reconnection**: Exponential backoff with jitter and periodic application-level ping/pong heartbeats.
 

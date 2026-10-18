@@ -310,3 +310,90 @@ async fn sixteen_mib_request_and_response_roundtrip_without_truncation() {
     assert_eq!(received, MAX_REQUEST_BODY_BYTES);
     server.abort();
 }
+
+#[tokio::test]
+async fn rest_api_methods_and_query_params_roundtrip_for_url_to_mcp() {
+    use axum::http::{Method, Uri};
+    use axum::routing::any;
+
+    let app = Router::new().route(
+        "/v1/items/:id",
+        any(
+            |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let payload = format!(
+                    "{}:{}:{}?{}:{}",
+                    method,
+                    uri.path(),
+                    uri.query().unwrap_or(""),
+                    auth,
+                    String::from_utf8_lossy(&body)
+                );
+                Response::builder()
+                    .status(if method == Method::DELETE { 204 } else { 200 })
+                    .header("content-type", "application/json")
+                    .header("x-request-id", "req-42")
+                    .body(Body::from(
+                        if method == Method::HEAD || method == Method::DELETE {
+                            Vec::new()
+                        } else {
+                            payload.into_bytes()
+                        },
+                    ))
+                    .unwrap()
+            },
+        ),
+    );
+    let (base, server) = serve(app).await;
+    let forwarder = HttpForwarder::new(false).unwrap();
+
+    for (method, body, expected_status) in [
+        ("GET", None, 200),
+        ("PUT", Some(br#"{"name":"updated"}"#.to_vec()), 200),
+        ("PATCH", Some(br#"{"status":"active"}"#.to_vec()), 200),
+        ("DELETE", None, 204),
+    ] {
+        let (tx, mut rx) = mpsc::channel(8);
+        forwarder
+            .execute_stream(
+                format!("stream-{method}"),
+                method.into(),
+                format!("{base}v1/items/99?expand=owner"),
+                vec![
+                    ("Authorization".into(), "Bearer secret-key".into()),
+                    ("Content-Type".into(), "application/json".into()),
+                ],
+                body.clone(),
+                Some(2_000),
+                tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let mut chunks = Vec::new();
+        let mut status_seen = None;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ConnectorToGatewayMessage::HttpResponseStart { status, .. } => {
+                    status_seen = Some(status);
+                }
+                ConnectorToGatewayMessage::HttpResponseChunk { data, .. } => chunks.extend(data),
+                ConnectorToGatewayMessage::HttpResponseEnd { .. } => break,
+                other => panic!("unexpected frame for {method}: {other:?}"),
+            }
+        }
+        assert_eq!(status_seen, Some(expected_status));
+        if expected_status == 204 {
+            assert!(chunks.is_empty());
+        } else {
+            let text = String::from_utf8(chunks).unwrap();
+            assert!(text.starts_with(&format!(
+                "{method}:/v1/items/99:expand=owner?Bearer secret-key:"
+            )));
+        }
+    }
+    server.abort();
+}
