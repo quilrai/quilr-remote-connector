@@ -1,0 +1,32 @@
+[package]
+name = "quilr-remote-connector"
+version = "0.1.0"
+edition = "2024"
+description = "Quilr Remote Connector — WebSocket reverse tunnel for private MCP servers"
+license = "MIT"
+
+[[bin]]
+name = "quilr-connector"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+bytes = "1.7"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+http = "1.1"
+hostname = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate", "zstd"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["test-util"] }
+axum = { version = "0.7", features = ["ws"] }

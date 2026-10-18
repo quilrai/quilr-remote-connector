@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: quilr-remote-connector-secret
+  namespace: default
+type: Opaque
+stringData:
+  # Replace with the self-contained token generated in Quilr Console -> AI Gateway -> MCP Gateway -> Remote Connectors
+  # The token automatically includes the MCP Gateway URL!
+  QUILR_CONNECTOR_TOKEN: "qrc_replace_with_token"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quilr-remote-connector
+  namespace: default
+  labels:
+    app: quilr-remote-connector
+spec:
+  # Multiple replicas can share the same token for High Availability & Load Balancing
+  replicas: 2
+  selector:
+    matchLabels:
+      app: quilr-remote-connector
+  template:
+    metadata:
+      labels:
+        app: quilr-remote-connector
+    spec:
+      containers:
+        - name: quilr-connector
+          image: ghcr.io/quilrai/quilr-connector:latest
+          imagePullPolicy: Always
+          env:
+            - name: QUILR_CONNECTOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: quilr-remote-connector-secret
+                  key: QUILR_CONNECTOR_TOKEN
+            - name: QUILR_CONNECTOR_INSTANCE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
