@@ -1,0 +1,8 @@
+# The release workflow supplies the same static Linux binaries published on GitHub.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ARG TARGETARCH
+COPY --chmod=755 dist/${TARGETARCH}/quilr-connector /usr/local/bin/quilr-connector
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/quilr-connector"]

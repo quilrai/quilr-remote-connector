@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional version label for manual dispatch (e.g. v0.1.0)"
-        required: false
-        default: "v0.1.0"
+        description: "Existing release tag to build and publish (e.g. v0.1.1)"
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -21,8 +25,56 @@ env:
   GHCR_IMAGE: ghcr.io/quilrai/quilr-connector
 
 jobs:
+  prepare:
+    name: Validate release tag and version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+      latest: ${{ steps.release.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      - name: Validate package version matches the tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
+              raise SystemExit("Release tag must be a stable version, such as v0.1.1")
+          with open("Cargo.toml", "rb") as source:
+              version = tomllib.load(source)["package"]["version"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag} does not match Cargo.toml version {version}")
+          result = subprocess.run(
+              ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/latest"],
+              capture_output=True, text=True,
+          )
+          latest = True
+          if result.returncode == 0:
+              published_tag = json.loads(result.stdout)["tag_name"]
+              latest = tuple(map(int, tag[1:].split("."))) >= tuple(map(int, published_tag.removeprefix("v").split(".")))
+          elif "HTTP 404" not in result.stderr:
+              raise SystemExit(result.stderr)
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"tag={tag}\nsha={sha}\nlatest={str(latest).lower()}\n")
+          PY
+
   build-binaries:
     name: Build (${{ matrix.target }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -46,6 +98,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -95,12 +149,28 @@ jobs:
 
   docker:
     name: Build & Push Multi-Arch GHCR Image
+    needs: [prepare, build-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Download Linux release binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: quilr-connector-*-unknown-linux-musl
+          path: artifacts
+          merge-multiple: true
+
+      - name: Prepare verified binaries for the Docker image
+        run: |
+          cd artifacts
+          sha256sum --check *.sha256
+          mkdir -p ../dist/amd64 ../dist/arm64
+          tar -xzf quilr-connector-x86_64-unknown-linux-musl.tar.gz -C ../dist/amd64
+          tar -xzf quilr-connector-aarch64-unknown-linux-musl.tar.gz -C ../dist/arm64
+          chmod +x ../dist/*/quilr-connector
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -117,16 +187,20 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.GHCR_IMAGE }}
+          flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=latest
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.tag }},enable=${{ needs.prepare.outputs.latest == 'true' }}
+            type=raw,value=sha-${{ needs.prepare.outputs.sha }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -136,18 +210,22 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
-    needs: [build-binaries, docker]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, build-binaries, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Download all binary artifacts
         uses: actions/download-artifact@v4
         with:
+          # Docker also uploads a .dockerbuild record, which is not a binary archive.
+          pattern: quilr-connector-*
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
+          make_latest: legacy
+          fail_on_unmatched_files: true
           files: artifacts/*

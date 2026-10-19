@@ -15,7 +15,7 @@ Lightweight Rust WebSocket reverse-tunnel binary that connects private MCP serve
 
 ### 1. Standalone Binary (Linux, macOS, Windows)
 
-Download the prebuilt binary for your platform from [GitHub Releases](https://github.com/quilrai/local-to-quilr-saas-connector/releases) (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`):
+Download the prebuilt binary for your platform from the [latest GitHub Release](https://github.com/quilrai/quilr-remote-connector/releases/latest) (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`):
 
 ```bash
 quilr-connector --token qrc_your_token_here
@@ -45,6 +45,31 @@ Apply `k8s/deployment.yaml` after setting `QUILR_CONNECTOR_TOKEN`:
 ```bash
 kubectl apply -f k8s/deployment.yaml
 ```
+
+## Building and Publishing a Release
+
+Build locally with `cargo build --release --locked`. The executable is written to `target/release/quilr-connector`.
+
+To publish a new stable release:
+
+1. Update the package version in `Cargo.toml` and the `quilr-remote-connector` entry in `Cargo.lock` to the new version.
+2. Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --locked`, then commit and push the changes to `main`.
+3. Create and push a matching tag, for example:
+
+   ```bash
+   git tag -a v0.1.2 -m "Release v0.1.2"
+   git push origin v0.1.2
+   ```
+
+The [release workflow](https://github.com/quilrai/quilr-remote-connector/actions/workflows/release.yml) verifies that the tag matches the package version, builds all five platform archives and SHA-256 checksums, pushes the multi-architecture Docker image, and publishes a GitHub Release. A tag alone does not create a Release page entry; the workflow must finish successfully.
+
+To rebuild an existing tag, rerun its workflow in GitHub Actions, or dispatch the workflow from `main` with the existing tag:
+
+```bash
+gh workflow run release.yml --ref main -f tag=v0.1.1
+```
+
+Manual dispatch supports tags from `v0.1.1` onward, checks out the tag's commit, and publishes the same versioned binaries and image tags. Rebuilding an older release does not move the Docker `latest` tag backward. The Docker image uses the verified Linux release binaries. GitHub download links under `/releases/latest/download/<asset-name>` follow the latest stable release automatically; keep archive names independent of the version.
 
 ## Tunnel Limits and Testing
 
