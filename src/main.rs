@@ -1,11 +1,14 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 use quilr_remote_connector::tunnel::{TunnelConfig, run_connector_forever};
+
+mod logging;
+mod service;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -14,72 +17,149 @@ use quilr_remote_connector::tunnel::{TunnelConfig, run_connector_forever};
     about = "Quilr Remote Connector — connects private cluster/local MCP servers and REST APIs (URL-to-MCP) to Quilr MCP Gateway over WebSocket"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the connector in the foreground (the default when no command is given)
+    Run(RunArgs),
+    /// Install and manage the connector as a background service that starts at boot
+    #[command(subcommand)]
+    Service(service::ServiceCommand),
+}
+
+/// Options for running the connector. Every flag can also be set by its environment variable.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct RunArgs {
     /// Connector authentication token generated in the Quilr Admin Console (qrc_<encoded_gateway_url>.<secret>)
     #[arg(long, env = "QUILR_CONNECTOR_TOKEN", hide_env_values = true)]
-    token: String,
+    pub token: Option<String>,
 
     /// Optional Quilr MCP Gateway base URL override (if omitted, automatically decoded from --token)
     #[arg(long, env = "QUILR_GATEWAY_URL")]
-    gateway_url: Option<String>,
+    pub gateway_url: Option<String>,
 
     /// Optional instance or pod label reported to the Admin Console (defaults to hostname)
     #[arg(long, env = "QUILR_CONNECTOR_INSTANCE_NAME")]
-    instance_name: Option<String>,
+    pub instance_name: Option<String>,
 
     /// Skip TLS certificate verification when connecting to local/internal HTTPS MCP servers
     #[arg(long, env = "QUILR_CONNECTOR_INSECURE_TLS", default_value_t = false)]
-    insecure_skip_tls_verify: bool,
+    pub insecure_skip_tls_verify: bool,
 
     /// Heartbeat ping interval in seconds
-    #[arg(long, env = "QUILR_CONNECTOR_PING_INTERVAL_SECS", default_value_t = 20)]
-    ping_interval_secs: u64,
+    #[arg(long, env = "QUILR_CONNECTOR_PING_INTERVAL_SECS", default_value_t = DEFAULT_PING_INTERVAL_SECS)]
+    pub ping_interval_secs: u64,
+
+    #[command(flatten)]
+    pub log: LogArgs,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+pub(crate) const DEFAULT_PING_INTERVAL_SECS: u64 = 20;
+pub(crate) const DEFAULT_HEARTBEAT_LOG_SECS: u64 = 300;
 
-    let cli = Cli::parse();
+#[derive(Args, Debug, Clone)]
+pub(crate) struct LogArgs {
+    /// Log level: error, warn, info, or debug
+    #[arg(long, env = "QUILR_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
+
+    /// Log format; `auto` prints text on a terminal and JSON otherwise
+    #[arg(long, env = "QUILR_LOG_FORMAT", value_enum, default_value_t = LogFormat::Auto)]
+    pub log_format: LogFormat,
+
+    /// Write logs to this file instead of stderr (rotated daily, 7 files kept)
+    #[arg(long, env = "QUILR_LOG_FILE")]
+    pub log_file: Option<PathBuf>,
+
+    /// Seconds between status summary log lines; 0 disables them
+    #[arg(long, env = "QUILR_HEARTBEAT_LOG_SECS", default_value_t = DEFAULT_HEARTBEAT_LOG_SECS)]
+    pub heartbeat_log_secs: u64,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogFormat {
+    Auto,
+    Json,
+    Text,
+}
+
+fn main() -> anyhow::Result<()> {
+    // `run` is the default command, so `quilr-connector --token ...` keeps working. Service
+    // commands never parse the run options, so a bad QUILR_* variable cannot block them.
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let first = argv.get(1).and_then(|arg| arg.to_str());
+    if !matches!(
+        first,
+        Some("run" | "service" | "help" | "-h" | "--help" | "-V" | "--version")
+    ) {
+        argv.insert(1, "run".into());
+    }
+    match Cli::parse_from(argv).command {
+        Command::Run(args) => run_foreground(args),
+        Command::Service(cmd) => service::run(cmd),
+    }
+}
+
+fn run_foreground(args: RunArgs) -> anyhow::Result<()> {
+    let Some(token) = args.token.filter(|t| !t.trim().is_empty()) else {
+        anyhow::bail!(
+            "missing connector token: pass --token or set QUILR_CONNECTOR_TOKEN\n\
+             (to run in the background at boot, see `quilr-connector service install --help`)"
+        );
+    };
+    let _log_guard = logging::init(&args.log)?;
 
     let config = TunnelConfig {
-        gateway_ws_url: cli.gateway_url,
-        token: cli.token,
-        instance_name: cli.instance_name,
-        insecure_skip_tls_verify: cli.insecure_skip_tls_verify,
-        ping_interval: Duration::from_secs(cli.ping_interval_secs.max(5)),
+        gateway_ws_url: args.gateway_url,
+        token,
+        instance_name: args.instance_name,
+        insecure_skip_tls_verify: args.insecure_skip_tls_verify,
+        ping_interval: Duration::from_secs(args.ping_interval_secs.max(5)),
     };
+    let heartbeat_interval = Duration::from_secs(args.log.heartbeat_log_secs);
 
-    let shutdown = CancellationToken::new();
-    let shutdown_signal = shutdown.clone();
-
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received SIGINT, shutting down connector...");
-                }
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM, shutting down connector...");
-                }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
+            let shutdown = CancellationToken::new();
+            tokio::spawn(wait_for_shutdown_signal(shutdown.clone()));
+            if !heartbeat_interval.is_zero() {
+                tokio::spawn(logging::heartbeat_loop(
+                    heartbeat_interval,
+                    shutdown.clone(),
+                ));
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Received Ctrl+C, shutting down connector...");
-        }
-        shutdown_signal.cancel();
-    });
+            run_connector_forever(config, shutdown).await?;
+            info!(event = "stopped", "Connector stopped");
+            Ok(())
+        })
+}
 
-    run_connector_forever(config, shutdown).await
+async fn wait_for_shutdown_signal(shutdown: CancellationToken) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM");
+        let signal = tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+        };
+        info!(event = "shutdown", signal, "Shutting down connector");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!(
+            event = "shutdown",
+            signal = "ctrl_c",
+            "Shutting down connector"
+        );
+    }
+    shutdown.cancel();
 }
 
 #[cfg(test)]
