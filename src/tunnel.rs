@@ -282,8 +282,9 @@ async fn run_single_session_tracked(
         }
     };
     *connected_at = Some(std::time::Instant::now());
-    telemetry::set_connected(true);
-    info!(event = "connected", "Connected to Quilr gateway");
+    // The server checks the token after the upgrade and closes with 4401 if it
+    // rejects it, so "connected" waits for the server's first message.
+    debug!("WebSocket open; waiting for the gateway to accept the token");
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (outbound_tx, mut outbound_rx) = OutboundSender::channel(OUTBOUND_QUEUE_CAPACITY);
@@ -305,6 +306,13 @@ async fn run_single_session_tracked(
         .send(hello)
         .await
         .map_err(|_| anyhow::anyhow!("Failed to enqueue hello message"))?;
+    // Its Pong is the server's first message, so acceptance shows at once
+    // rather than after the first heartbeat.
+    outbound_tx
+        .send(ConnectorToGatewayMessage::Ping { ts: unix_ms() })
+        .await
+        .map_err(|_| anyhow::anyhow!("Failed to enqueue the first ping"))?;
+    let mut accepted = false;
 
     let mut active_streams: HashMap<String, CancellationToken> = HashMap::new();
     let mut stream_tasks = JoinSet::new();
@@ -403,6 +411,11 @@ async fn run_single_session_tracked(
                 };
 
                 if let Some(parsed) = parsed_message {
+                    if !accepted && parsed.is_ok() {
+                        accepted = true;
+                        telemetry::set_connected(true);
+                        info!(event = "connected", "Connected to Quilr gateway");
+                    }
                     match parsed {
                         Ok(GatewayToConnectorMessage::HttpRequest {
                             stream_id,
