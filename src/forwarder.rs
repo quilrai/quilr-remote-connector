@@ -1,15 +1,16 @@
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::Method;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{Level, info, warn};
 use url::Url;
 
 use crate::outbound::OutboundSender;
 use crate::protocol::ConnectorToGatewayMessage;
+use crate::telemetry;
 
 /// Bound both WebSocket frame size and memory retained by the outbound queue.
 pub const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
@@ -44,6 +45,64 @@ fn is_hop_by_hop(name: &str, connection_headers: &HashSet<String>) -> bool {
     HOP_BY_HOP_HEADERS.contains(&lower.as_str()) || connection_headers.contains(&lower)
 }
 
+/// Coarse failure category for logs; the full message is only sent to the gateway.
+#[derive(Debug, Clone, Copy)]
+enum ErrorKind {
+    InvalidRequest,
+    Timeout,
+    Connect,
+    Upstream,
+    Gateway,
+}
+
+impl ErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Upstream => "upstream",
+            Self::Gateway => "gateway_queue",
+        }
+    }
+
+    fn of(err: &anyhow::Error) -> Self {
+        err.downcast_ref::<KindedError>()
+            .map_or(Self::InvalidRequest, |e| e.kind)
+    }
+}
+
+/// An error message tagged with its [`ErrorKind`]; displays as the bare message.
+#[derive(Debug)]
+struct KindedError {
+    kind: ErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for KindedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for KindedError {}
+
+fn kinded(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
+    KindedError {
+        kind,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// What a stream produced, filled in as it progresses.
+#[derive(Default)]
+struct Progress {
+    status: Option<u16>,
+    bytes: u64,
+    sse: bool,
+}
+
 /// Every queue wait must release the upstream response when the stream/session is cancelled.
 async fn enqueue(
     outbound_tx: &OutboundSender,
@@ -54,7 +113,7 @@ async fn enqueue(
         biased;
         _ = cancel_token.cancelled() => Ok(false),
         result = outbound_tx.send(message) => {
-            result.map_err(|_| anyhow::anyhow!("WebSocket outbound channel closed"))?;
+            result.map_err(|_| kinded(ErrorKind::Gateway, "WebSocket outbound channel closed"))?;
             Ok(true)
         }
     }
@@ -67,7 +126,7 @@ async fn idle_timeout<T>(
     match timeout {
         Some(timeout) => tokio::time::timeout(timeout, future)
             .await
-            .map_err(|_| anyhow::anyhow!("Upstream request idle timeout")),
+            .map_err(|_| kinded(ErrorKind::Timeout, "Upstream request idle timeout")),
         None => Ok(future.await),
     }
 }
@@ -107,6 +166,9 @@ impl HttpForwarder {
         cancel_token: CancellationToken,
     ) {
         let outbound_tx = outbound_tx.into();
+        let _active = telemetry::ActiveStream::begin();
+        let started = Instant::now();
+        let mut progress = Progress::default();
         let result = self
             .run_inner(
                 &stream_id,
@@ -117,13 +179,65 @@ impl HttpForwarder {
                 timeout_ms,
                 &outbound_tx,
                 &cancel_token,
+                &mut progress,
             )
             .await;
+
+        // Logs carry only the target host; the path is added at debug level.
+        let parsed_url = Url::parse(&target_url).ok();
+        let target = parsed_url
+            .as_ref()
+            .map(|url| match (url.host_str(), url.port()) {
+                (Some(host), Some(port)) => format!("{host}:{port}"),
+                (Some(host), None) => host.to_string(),
+                _ => String::new(),
+            });
+        let path = parsed_url
+            .as_ref()
+            .filter(|_| tracing::enabled!(Level::DEBUG))
+            .map(|url| url.path().to_string());
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let failure = result
+            .as_ref()
+            .err()
+            .filter(|_| !cancel_token.is_cancelled());
+        telemetry::record_request(failure.is_some());
+        let outcome = if failure.is_some() {
+            "error"
+        } else if cancel_token.is_cancelled() {
+            "cancelled"
+        } else {
+            "ok"
+        };
+        macro_rules! log_request {
+            ($level:ident, $($extra:tt)*) => {
+                $level!(
+                    event = "request",
+                    method = %method.to_ascii_uppercase(),
+                    target = target.as_deref(),
+                    path = path.as_deref(),
+                    status = progress.status,
+                    duration_ms,
+                    bytes = progress.bytes,
+                    sse = progress.sse,
+                    outcome,
+                    $($extra)*
+                )
+            };
+        }
+        match failure {
+            Some(err) => log_request!(
+                warn,
+                error_kind = ErrorKind::of(err).as_str(),
+                "Request failed"
+            ),
+            None if outcome == "cancelled" => log_request!(info, "Request cancelled"),
+            None => log_request!(info, "Request completed"),
+        }
 
         if let Err(err) = result
             && !cancel_token.is_cancelled()
         {
-            debug!(stream_id = %stream_id, error = %err, "Stream failed with error");
             let _ = enqueue(
                 &outbound_tx,
                 &cancel_token,
@@ -147,6 +261,7 @@ impl HttpForwarder {
         timeout_ms: Option<u64>,
         outbound_tx: &OutboundSender,
         cancel_token: &CancellationToken,
+        progress: &mut Progress,
     ) -> anyhow::Result<()> {
         let parsed_url = Url::parse(target_url)
             .map_err(|e| anyhow::anyhow!("Invalid target URL '{target_url}': {e}"))?;
@@ -190,11 +305,26 @@ impl HttpForwarder {
             biased;
             _ = cancel_token.cancelled() => return Ok(()),
             res = idle_timeout(timeout, req_builder.send()) => {
-                res?.map_err(|e| anyhow::anyhow!("Upstream request error: {e}"))?
+                res?.map_err(|e| {
+                    let kind = if e.is_timeout() {
+                        ErrorKind::Timeout
+                    } else if e.is_connect() {
+                        ErrorKind::Connect
+                    } else {
+                        ErrorKind::Upstream
+                    };
+                    kinded(kind, format!("Upstream request error: {e}"))
+                })?
             }
         };
 
         let status = response.status().as_u16();
+        progress.status = Some(status);
+        progress.sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"));
         let raw_headers: Vec<_> = response
             .headers()
             .iter()
@@ -231,14 +361,12 @@ impl HttpForwarder {
         loop {
             let next_chunk = tokio::select! {
                 biased;
-                _ = cancel_token.cancelled() => {
-                    debug!(stream_id = %stream_id, "Stream cancelled by gateway");
-                    return Ok(());
-                }
+                _ = cancel_token.cancelled() => return Ok(()),
                 result = idle_timeout(timeout, byte_stream.next()) => result?,
             };
             match next_chunk {
                 Some(Ok(bytes)) => {
+                    progress.bytes += bytes.len() as u64;
                     for chunk in bytes.chunks(RESPONSE_CHUNK_BYTES) {
                         if !enqueue(
                             outbound_tx,
@@ -255,8 +383,10 @@ impl HttpForwarder {
                     }
                 }
                 Some(Err(err)) => {
-                    warn!(stream_id = %stream_id, error = %err, "Error reading upstream body stream");
-                    return Err(anyhow::anyhow!("Stream read error: {err}"));
+                    return Err(kinded(
+                        ErrorKind::Upstream,
+                        format!("Stream read error: {err}"),
+                    ));
                 }
                 None => {
                     enqueue(

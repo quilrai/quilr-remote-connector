@@ -9,12 +9,13 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::forwarder::{HttpForwarder, MAX_REQUEST_BODY_BYTES};
 use crate::outbound::{MAX_WIRE_MESSAGE_BYTES, OutboundFrame, OutboundSender, WirePayload};
 use crate::protocol::{ConnectorToGatewayMessage, GatewayToConnectorMessage};
+use crate::telemetry;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE, URL_SAFE_NO_PAD};
@@ -113,6 +114,24 @@ impl TunnelConfig {
     }
 }
 
+/// The gateway closed the session because it rejected the connector token.
+#[derive(Debug)]
+struct AuthRejected {
+    code: u16,
+}
+
+impl std::fmt::Display for AuthRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gateway rejected connector authentication (code {})",
+            self.code
+        )
+    }
+}
+
+impl std::error::Error for AuthRejected {}
+
 pub const MAX_ACTIVE_STREAMS: usize = 128;
 const OUTBOUND_QUEUE_CAPACITY: usize = 512;
 const WEBSOCKET_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -135,36 +154,34 @@ pub async fn run_connector_forever(
     // Bound the sleep between attempts to 10 seconds plus less than 500 ms jitter.
     let max_backoff_ms: u64 = 10_000;
 
-    info!(gateway_ws_url = %ws_url, "Starting Quilr Remote Connector");
+    let gateway = Url::parse(&ws_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    info!(
+        event = "startup",
+        version = env!("CARGO_PKG_VERSION"),
+        gateway = %gateway,
+        "Starting Quilr Remote Connector"
+    );
 
     loop {
         if shutdown.is_cancelled() {
-            info!("Shutdown signal received, exiting connector loop");
             return Ok(());
         }
 
         let mut connected_at = None;
-        match run_single_session_tracked(
+        let session = run_single_session_tracked(
             &ws_url,
             &config,
             forwarder.clone(),
             shutdown.clone(),
             &mut connected_at,
         )
-        .await
-        {
-            Ok(()) => {
-                if shutdown.is_cancelled() {
-                    return Ok(());
-                }
-                info!("WebSocket session closed cleanly; reconnecting...");
-            }
-            Err(err) => {
-                if shutdown.is_cancelled() {
-                    return Ok(());
-                }
-                warn!(error = %err, "WebSocket session terminated; will retry");
-            }
+        .await;
+        telemetry::set_connected(false);
+        if shutdown.is_cancelled() {
+            return Ok(());
         }
 
         // If the session stayed up for more than 30 seconds, reset the backoff timer.
@@ -181,10 +198,33 @@ pub async fn run_connector_forever(
             .subsec_nanos() as u64)
             % 500;
         let sleep_dur = Duration::from_millis(backoff_ms + jitter_ms);
-        info!(
-            retry_in_ms = sleep_dur.as_millis(),
-            "Waiting before reconnecting to gateway"
-        );
+        let retry_in_ms = sleep_dur.as_millis() as u64;
+        match &session {
+            Ok(()) => info!(
+                event = "disconnected",
+                reason = "closed by gateway",
+                retry_in_ms,
+                "Gateway session closed; reconnecting"
+            ),
+            Err(err) if err.is::<AuthRejected>() => error!(
+                event = "auth_rejected",
+                reason = %err,
+                retry_in_ms,
+                "Gateway rejected the connector token; check that it is valid and not revoked"
+            ),
+            Err(err) if connected_at.is_none() => warn!(
+                event = "connect_failed",
+                reason = %err,
+                retry_in_ms,
+                "Could not connect to gateway; retrying"
+            ),
+            Err(err) => warn!(
+                event = "disconnected",
+                reason = %err,
+                retry_in_ms,
+                "Gateway session lost; reconnecting"
+            ),
+        }
 
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -242,7 +282,8 @@ async fn run_single_session_tracked(
         }
     };
     *connected_at = Some(std::time::Instant::now());
-    info!(gateway = %ws_url, "Connected to Quilr MCP Gateway");
+    telemetry::set_connected(true);
+    info!(event = "connected", "Connected to Quilr gateway");
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (outbound_tx, mut outbound_rx) = OutboundSender::channel(OUTBOUND_QUEUE_CAPACITY);
@@ -345,12 +386,9 @@ async fn run_single_session_tracked(
                         if let Some(cf) = frame {
                             let code: u16 = cf.code.into();
                             if code == 4401 || code == 4403 {
-                                session_result = Err(anyhow::anyhow!(
-                                    "Gateway rejected connector authentication (code {code}: {})",
-                                    cf.reason
-                                ));
+                                session_result = Err(AuthRejected { code }.into());
                             } else {
-                                info!(code = code, reason = %cf.reason, "Gateway closed WebSocket");
+                                debug!(code, reason = %cf.reason, "Gateway closed WebSocket");
                             }
                         }
                         break;
@@ -375,12 +413,12 @@ async fn run_single_session_tracked(
                             body_b64,
                             timeout_ms,
                         }) => {
-                            debug!(stream_id = %stream_id, method = %method, url = %url, "Dispatching HTTP request");
                             if stream_id.is_empty() || active_streams.contains_key(&stream_id) {
                                 session_result = Err(anyhow::anyhow!("Invalid or duplicate active stream ID"));
                                 break;
                             }
                             if active_streams.len() >= MAX_ACTIVE_STREAMS {
+                                warn!(event = "request_rejected", reason = "capacity", "Too many concurrent requests; rejected one");
                                 if outbound_tx.try_send(ConnectorToGatewayMessage::HttpResponseError {
                                     stream_id,
                                     error: "Remote connector maximum active stream capacity reached".to_string(),
@@ -445,7 +483,7 @@ async fn run_single_session_tracked(
                         }
                         Ok(GatewayToConnectorMessage::Pong { .. }) => {}
                         Err(err) => {
-                            warn!(error = %err, "Ignored unrecognized message from gateway");
+                            debug!(error = %err, "Ignored unrecognized message from gateway");
                         }
                     }
                 }
